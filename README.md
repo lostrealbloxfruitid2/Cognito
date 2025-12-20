@@ -1,2 +1,0 @@
-# Cognito
-Just a bot 
