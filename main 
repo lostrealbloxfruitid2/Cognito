@@ -1,0 +1,236 @@
+import discord
+from discord.ext import commands
+from discord import app_commands
+import json
+import os
+from datetime import datetime
+
+--- Configuration & Setup ---
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+
+bot = commands.Bot(command_prefix="b.", intents=intents)
+
+@bot.event
+async def on_ready():
+print(f"✅ Logged in as {bot.user}")
+
+BACKUP_FILE = "Backup.json"
+MAX_MESSAGES = 500
+
+SUCCESS = "<:BloxpixelSuccess:1467437159865778186>"
+ERROR = "<:BloxpixelErorr:1467437251251409050>"
+DANGER = "<:BloxpixelDanger:"
+
+--- Utility Functions ---
+
+def load_backup():
+if not os.path.exists(BACKUP_FILE):
+with open(BACKUP_FILE, "w") as f:
+json.dump({
+"message_toggle": False,
+"messages": {},
+"roles": {},
+"categories": {},
+"channels": {},
+"members": {}
+}, f, indent=4)
+with open(BACKUP_FILE, "r") as f:
+return json.load(f)
+
+def save_backup(data):
+with open(BACKUP_FILE, "w") as f:
+json.dump(data, f, indent=4)
+
+--- Events ---
+
+@bot.event
+async def on_message(message):
+if message.author.bot:
+return
+
+data = load_backup()    
+# Check if message saving is toggled on    
+if not data["message_toggle"]:    
+    await bot.process_commands(message)    
+    return    
+
+cid = str(message.channel.id)    
+data["messages"].setdefault(cid, [])    
+
+data["messages"][cid].append({    
+    "author_id": message.author.id,    
+    "author_name": message.author.name,    
+    "content": message.content,    
+    "timestamp": datetime.utcnow().isoformat()    
+})    
+
+# Limit message history per channel    
+if len(data["messages"][cid]) > MAX_MESSAGES:    
+    data["messages"][cid].pop(0)    
+
+save_backup(data)    
+    
+# Critical: Ensure commands still work    
+await bot.process_commands(message)
+
+--- Commands ---
+
+🔁 Message Toggle
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def um(ctx):
+data = load_backup()
+data["message_toggle"] = not data["message_toggle"]
+save_backup(data)
+
+status = "ON" if data["message_toggle"] else "OFF"    
+await ctx.send(embed=discord.Embed(    
+    description=f"{SUCCESS} Message saving **{status}**",    
+    color=0x00ff00    
+))
+
+📤 Extract Messages
+
+@bot.command()
+async def m(ctx):
+data = load_backup()
+if not data["message_toggle"]:
+return await ctx.send(embed=discord.Embed(
+description=f"{ERROR} Message saving is OFF",
+color=0xff0000
+))
+
+msgs = data["messages"].get(str(ctx.channel.id))    
+if not msgs:    
+    return await ctx.send(embed=discord.Embed(    
+        description=f"{ERROR} No messages saved",    
+        color=0xff0000    
+    ))    
+
+# Pagination: Groups of 5 messages    
+pages = [msgs[i:i+5] for i in range(0, len(msgs), 5)]    
+
+for page in pages:    
+    embed = discord.Embed(title="📦 Message Backup", color=0x2f3136)    
+    for m in page:    
+        embed.add_field(    
+            name=m["author_name"],    
+            value=m["content"] or "*No content*",    
+            inline=False    
+        )    
+    await ctx.send(embed=embed)
+
+💾 Save Server Backup
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def save(ctx):
+guild = ctx.guild
+data = load_backup()
+
+data["roles"] = {    
+    str(r.id): {    
+        "name": r.name,    
+        "color": r.color.value,    
+        "permissions": r.permissions.value,    
+        "position": r.position    
+    } for r in guild.roles if not r.is_default()    
+}    
+
+data["categories"] = {    
+    str(c.id): {"name": c.name, "position": c.position}    
+    for c in guild.categories    
+}    
+
+data["channels"] = {    
+    str(ch.id): {    
+        "name": ch.name,    
+        "type": str(ch.type),    
+        "category": ch.category_id,    
+        "position": ch.position    
+    } for ch in guild.channels    
+}    
+
+data["members"] = {    
+    str(m.id): m.name for m in guild.members    
+}    
+
+save_backup(data)    
+
+await ctx.send(embed=discord.Embed(    
+    description=f"{SUCCESS} Backup saved successfully",    
+    color=0x00ff00    
+))
+
+♻ Restore Server Backup
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def restore(ctx):
+guild = ctx.guild
+data = load_backup()
+
+# -------- ROLES --------    
+for role in guild.roles:    
+    if not role.is_default() and str(role.id) not in data["roles"]:    
+        try:    
+            await role.delete()    
+        except (discord.Forbidden, discord.HTTPException):    
+            pass    
+
+for rid, r in data["roles"].items():    
+    if not discord.utils.get(guild.roles, name=r["name"]):    
+        await guild.create_role(    
+            name=r["name"],    
+            color=discord.Color(r["color"]),    
+            permissions=discord.Permissions(r["permissions"])    
+        )    
+            
+# 3️⃣ DELETE EXTRA CHANNELS    
+for ch in guild.channels:    
+    if str(ch.id) not in data["channels"]:    
+        try:    
+            await ch.delete()    
+        except (discord.Forbidden, discord.HTTPException):    
+            pass    
+
+# -------- CATEGORIES --------    
+created_categories = {}    
+
+for cid, c in data["categories"].items():    
+    existing = discord.utils.get(guild.categories, name=c["name"])    
+    if not existing:    
+        new_cat = await guild.create_category(    
+            c["name"],    
+            position=c["position"]    
+        )    
+        created_categories[cid] = new_cat    
+    else:    
+        created_categories[cid] = existing    
+
+# Restore channel positions inside categories    
+for category in guild.categories:    
+    positions = {}    
+    for channel in category.channels:    
+        cid = str(channel.id)    
+        if cid in data["channels"]:    
+            positions[channel] = data["channels"][cid]["position"]    
+
+    if positions:    
+        await category.edit(text_channels=positions)    
+
+await ctx.send(    
+    embed=discord.Embed(    
+        description=f"{SUCCESS} Backup restored successfully",    
+        color=0x00ff00    
+    )    
+)
+
+--- Run Bot ---
+TOKEN = os.getenv("DISCORD_TOKEN")
+
+bot.run("TOKEN")
